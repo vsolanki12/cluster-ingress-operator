@@ -130,6 +130,27 @@ func New(mgr manager.Manager, config Config) (controller.Controller, error) {
 	if err := c.Watch(source.Kind[client.Object](operatorCache, &appsv1.Deployment{}, enqueueRequestForOwningIngressController(config.Namespace))); err != nil {
 		return nil, err
 	}
+	// Watch for changes that can make a router pod schedulable. Node status
+	// updates are filtered below so regular node heartbeats do not enqueue all
+	// ingresscontrollers.
+	if err := c.Watch(source.Kind[client.Object](operatorCache, &corev1.Node{}, handler.EnqueueRequestsFromMapFunc(reconciler.ingressConfigToIngressController), predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, oldOK := e.ObjectOld.(*corev1.Node)
+			newNode, newOK := e.ObjectNew.(*corev1.Node)
+			if !oldOK || !newOK {
+				return true
+			}
+			return !cmp.Equal(oldNode.Labels, newNode.Labels) ||
+				oldNode.Spec.Unschedulable != newNode.Spec.Unschedulable ||
+				!cmp.Equal(oldNode.Spec.Taints, newNode.Spec.Taints) ||
+				nodeReadyStatus(oldNode) != nodeReadyStatus(newNode)
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	})); err != nil {
+		return nil, err
+	}
 	if err := c.Watch(source.Kind[client.Object](operatorCache, &corev1.Service{}, enqueueRequestForOwningIngressController(config.Namespace))); err != nil {
 		return nil, err
 	}
@@ -178,15 +199,15 @@ func New(mgr manager.Manager, config Config) (controller.Controller, error) {
 	return c, nil
 }
 
-func (r *reconciler) ingressConfigToIngressController(ctx context.Context, o client.Object) []reconcile.Request {
+func (r *reconciler) ingressConfigToIngressController(ctx context.Context, _ client.Object) []reconcile.Request {
 	var requests []reconcile.Request
 	controllers := &operatorv1.IngressControllerList{}
 	if err := r.cache.List(ctx, controllers, client.InNamespace(r.config.Namespace)); err != nil {
-		log.Error(err, "failed to list ingresscontrollers for ingress", "related", o.GetSelfLink())
+		log.Error(err, "failed to list ingresscontrollers")
 		return requests
 	}
 	for _, ic := range controllers.Items {
-		log.Info("queueing ingresscontroller", "name", ic.Name, "related", o.GetSelfLink())
+		log.Info("queueing ingresscontroller", "name", ic.Name)
 		request := reconcile.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: ic.Namespace,
@@ -1359,7 +1380,16 @@ func (r *reconciler) ensureIngressController(ci *operatorv1.IngressController, d
 		errs = append(errs, fmt.Errorf("failed to list pods in namespace %q: %v", operatorcontroller.DefaultOperatorNamespace, err))
 	}
 
-	syncStatusErr, updated := r.syncIngressControllerStatus(ci, deployment, deploymentRef, pods.Items, lbService, operandEvents.Items, wildcardRecord, dnsConfig, platformStatus, ingressConfig)
+	// The node list is used to distinguish the initial HCP state, where the
+	// ingress operator can be ready before guest worker nodes exist, from a
+	// later router outage. A list failure must not be treated as an empty list.
+	nodes := &corev1.NodeList{}
+	if err := r.cache.List(context.TODO(), nodes); err != nil {
+		errs = append(errs, fmt.Errorf("failed to list nodes: %v", err))
+		nodes = nil
+	}
+
+	syncStatusErr, updated := r.syncIngressControllerStatus(ci, deployment, deploymentRef, pods.Items, lbService, operandEvents.Items, wildcardRecord, dnsConfig, platformStatus, ingressConfig, infraConfig.Status.ControlPlaneTopology, nodes)
 	errs = append(errs, syncStatusErr)
 
 	// If syncIngressControllerStatus updated our ingress status, it's important we query for that new object.
